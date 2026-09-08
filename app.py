@@ -606,7 +606,7 @@ with st.sidebar:
 # -----------------------------
 # Main tabs
 # -----------------------------
-tab_dash, tab_goal, tab_diet, tab_week, tab_track, tab_settings = st.tabs(
+tab_dash, tab_goal, tab_diet, tab_track, tab_settings = st.tabs(
     ["🏠 Dashboard", "🎯 Objektivi", "🍽️ Dieta", "⚖️ Tracking", "⚙️ Settings"]
 )
 
@@ -748,21 +748,6 @@ with tab_diet:
                 text.append(f"- {item['name']}: {round(item['grams'])} g")
             text.append("")
         st.download_button("📥 Shkarko planin (.txt)", "\n".join(text), "nutritrack_plan.txt", use_container_width=True)
-
-with tab_week:
-    st.subheader("")
-    if not st.session_state.plan:
-        st.info("Gjenero fillimisht dietën te **Objektivi**.")
-    else:
-        inp = st.session_state.last_inputs
-        st.caption("Versioni bazë përdor të njëjtin target ditor dhe ndryshon kombinimet e ushqimeve.")
-        days = ["E Hënë","E Martë","E Mërkurë","E Enjte","E Premte","E Shtunë","E Diel"]
-        for d_i, day_name in enumerate(days):
-            with st.expander(day_name, expanded=(d_i == 0)):
-                for m_i, meal in enumerate(st.session_state.plan):
-                    # Show compact preview; daily plan remains fast to load.
-                    names = [x["name"] for x in meal["items"]]
-                    st.write(f"**{meal['name']}** · ~{round(meal['totals']['kcal'])} kcal — " + ", ".join(names[:3]))
 
 with tab_track:
     st.subheader("⚖️ Tracking i peshës")
