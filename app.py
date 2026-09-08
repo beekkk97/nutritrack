@@ -14,6 +14,49 @@ st.set_page_config(
 
 API_BASE = "https://world.openfoodfacts.org/api/v2/search"
 
+# Curated fallback foods: used whenever API data are missing/invalid.
+# Values are approximate per 100 g and are not intended as medical prescriptions.
+FALLBACK_FOODS = {
+    "protein": [
+        {"product_name":"Gjoks pule, i pjekur","kcal":165,"protein":31.0,"carbs":0.0,"fat":3.6},
+        {"product_name":"Gjoks gjeli, i pjekur","kcal":135,"protein":29.0,"carbs":0.0,"fat":1.6},
+        {"product_name":"Ton në ujë, i kulluar","kcal":116,"protein":26.0,"carbs":0.0,"fat":1.0},
+        {"product_name":"Salmon","kcal":208,"protein":20.0,"carbs":0.0,"fat":13.0},
+        {"product_name":"Vezë","kcal":143,"protein":12.6,"carbs":0.7,"fat":9.5},
+        {"product_name":"Kos grek","kcal":73,"protein":9.9,"carbs":3.9,"fat":2.0},
+        {"product_name":"Mish viçi pa dhjamë","kcal":170,"protein":26.0,"carbs":0.0,"fat":7.0},
+    ],
+    "carb": [
+        {"product_name":"Oriz i gatuar","kcal":130,"protein":2.7,"carbs":28.2,"fat":0.3},
+        {"product_name":"Tërshërë","kcal":389,"protein":16.9,"carbs":66.3,"fat":6.9},
+        {"product_name":"Patate të ziera","kcal":87,"protein":1.9,"carbs":20.1,"fat":0.1},
+        {"product_name":"Makarona të gatuara","kcal":158,"protein":5.8,"carbs":30.9,"fat":0.9},
+        {"product_name":"Bukë integrale","kcal":247,"protein":13.0,"carbs":41.0,"fat":4.2},
+        {"product_name":"Quinoa e gatuar","kcal":120,"protein":4.4,"carbs":21.3,"fat":1.9},
+    ],
+    "vegetable": [
+        {"product_name":"Brokoli","kcal":35,"protein":2.4,"carbs":7.2,"fat":0.4},
+        {"product_name":"Domate","kcal":18,"protein":0.9,"carbs":3.9,"fat":0.2},
+        {"product_name":"Karrota","kcal":41,"protein":0.9,"carbs":9.6,"fat":0.2},
+        {"product_name":"Speca","kcal":31,"protein":1.0,"carbs":6.0,"fat":0.3},
+        {"product_name":"Sallatë jeshile","kcal":15,"protein":1.4,"carbs":2.9,"fat":0.2},
+        {"product_name":"Perime të përziera","kcal":55,"protein":3.0,"carbs":10.0,"fat":0.5},
+    ],
+    "fruit": [
+        {"product_name":"Banane","kcal":89,"protein":1.1,"carbs":22.8,"fat":0.3},
+        {"product_name":"Mollë","kcal":52,"protein":0.3,"carbs":13.8,"fat":0.2},
+        {"product_name":"Portokall","kcal":47,"protein":0.9,"carbs":11.8,"fat":0.1},
+        {"product_name":"Manaferra","kcal":43,"protein":1.4,"carbs":9.6,"fat":0.5},
+    ],
+    "fat": [
+        {"product_name":"Vaj ulliri","kcal":884,"protein":0.0,"carbs":0.0,"fat":100.0},
+        {"product_name":"Bajame","kcal":579,"protein":21.2,"carbs":21.6,"fat":49.9},
+        {"product_name":"Arra","kcal":654,"protein":15.2,"carbs":13.7,"fat":65.2},
+        {"product_name":"Avokado","kcal":160,"protein":2.0,"carbs":8.5,"fat":14.7},
+        {"product_name":"Fara chia","kcal":486,"protein":16.5,"carbs":42.1,"fat":30.7},
+    ],
+}
+
 # -----------------------------
 # Styling
 # -----------------------------
@@ -199,29 +242,48 @@ def get_food_pool(role, mode):
     out = []
     for p in products:
         name = str(p.get("product_name") or "").strip()
-        n = p.get("nutriments", {}) or {}
-        if not name or name.lower() in seen:
-            continue
-        if not n.get("energy-kcal_100g") and not n.get("energy-kcal"):
+        if not name or name.lower() in seen or not valid_food(p):
             continue
         if mode == "Healthy" and not healthy_ok(p):
             continue
         seen.add(name.lower())
         out.append(p)
+
+    # Always merge curated foods so the generator remains functional.
+    for f in FALLBACK_FOODS[role]:
+        if mode == "Healthy" and f["kcal"] > 650 and role != "fat":
+            continue
+        if f["product_name"].lower() not in seen:
+            out.append(f)
+            seen.add(f["product_name"].lower())
     return out
 
 def food_nutrition(p, grams):
     n = p.get("nutriments", {}) or {}
-    kcal = num(n.get("energy-kcal_100g") or n.get("energy-kcal"))
-    protein = num(n.get("proteins_100g"))
-    carbs = num(n.get("carbohydrates_100g"))
-    fat = num(n.get("fat_100g"))
+    if n:
+        kcal = num(n.get("energy-kcal_100g") or n.get("energy-kcal"))
+        protein = num(n.get("proteins_100g"))
+        carbs = num(n.get("carbohydrates_100g"))
+        fat = num(n.get("fat_100g"))
+    else:
+        kcal = num(p.get("kcal"))
+        protein = num(p.get("protein"))
+        carbs = num(p.get("carbs"))
+        fat = num(p.get("fat"))
     return {
         "kcal": kcal*grams/100,
         "protein": protein*grams/100,
         "carbs": carbs*grams/100,
         "fat": fat*grams/100,
     }
+
+def valid_food(p):
+    x = food_nutrition(p, 100)
+    return (
+        bool(str(p.get("product_name") or "").strip())
+        and x["kcal"] > 0
+        and (x["protein"] + x["carbs"] + x["fat"]) > 0
+    )
 
 def pick(pool, seed):
     if not pool:
@@ -232,65 +294,93 @@ def pick(pool, seed):
 def build_meal(target, mode, meal_idx, seed):
     pools = {r: get_food_pool(r, mode) for r in ROLE_CATEGORIES}
     rng = random.Random(seed)
-    candidates = []
+    best = None
 
-    # Several candidate meals; choose closest to calorie + macro target.
-    for attempt in range(22):
-        p1 = pick(pools["protein"], seed + attempt*13 + 1)
-        p2 = pick(pools["carb"], seed + attempt*13 + 2)
-        p3 = pick(pools["vegetable"], seed + attempt*13 + 3)
-        p4 = pick(pools["fruit"], seed + attempt*13 + 4)
-        p5 = pick(pools["fat"], seed + attempt*13 + 5)
-        if not all([p1,p2,p3]):
+    # Role portions make meals nutritionally logical instead of random piles.
+    for attempt in range(35):
+        chosen = []
+        for role in ["protein", "carb", "vegetable", "fruit", "fat"]:
+            pool = pools[role]
+            if not pool:
+                continue
+            chosen.append((role, rng.choice(pool)))
+
+        if not chosen:
             continue
 
-        # Initial role grams scaled to target calories.
+        # Start with sensible serving ranges.
         grams = {
-            "protein": rng.randint(110, 210),
-            "carb": rng.randint(90, 220),
-            "vegetable": rng.randint(120, 300),
-            "fruit": rng.randint(70, 180),
-            "fat": rng.randint(10, 30),
+            "protein": rng.randint(120, 220),
+            "carb": rng.randint(90, 240),
+            "vegetable": rng.randint(150, 300),
+            "fruit": rng.randint(80, 180),
+            "fat": rng.randint(5, 20),
         }
-        chosen = [("protein",p1),("carb",p2),("vegetable",p3),("fruit",p4),("fat",p5)]
-        total = {"kcal":0,"protein":0,"carbs":0,"fat":0}
-        for role,p in chosen:
-            x = food_nutrition(p, grams[role])
-            for k in total: total[k] += x[k]
 
-        # Scale all grams to approximate kcal, then fine-tune with random factors.
+        # Snack-like meals should be lighter; main meals get all roles.
+        if target["kcal"] < 350:
+            grams["protein"] = rng.randint(80, 150)
+            grams["carb"] = rng.randint(40, 120)
+            grams["vegetable"] = rng.randint(80, 180)
+            grams["fruit"] = rng.randint(60, 140)
+            grams["fat"] = rng.randint(5, 12)
+
+        def calc(grams_map):
+            total = {"kcal":0,"protein":0,"carbs":0,"fat":0}
+            for role, p in chosen:
+                x = food_nutrition(p, grams_map[role])
+                for k in total:
+                    total[k] += x[k]
+            return total
+
+        total = calc(grams)
+        # Scale toward kcal, then make up to 3 local adjustments.
         scale = target["kcal"] / max(total["kcal"], 1)
         for role in grams:
-            grams[role] = max(5, min(450, grams[role]*scale))
-        # Extra protein emphasis.
-        if total["protein"] < target["protein"] * .75:
-            grams["protein"] = min(300, grams["protein"]*1.25)
+            grams[role] = max(5, min(450, grams[role] * scale))
+        for _ in range(3):
+            total = calc(grams)
+            ratio = target["kcal"] / max(total["kcal"], 1)
+            for role in ["protein", "carb"]:
+                grams[role] = max(5, min(450, grams[role] * ratio))
+            if total["protein"] < target["protein"] * 0.75:
+                grams["protein"] = min(300, grams["protein"] * 1.12)
 
-        final = {"kcal":0,"protein":0,"carbs":0,"fat":0}
-        items = []
-        for role,p in chosen:
-            g = round(grams[role]/5)*5
-            x = food_nutrition(p,g)
-            for k in final: final[k] += x[k]
-            items.append({
-                "role": role,
-                "name": str(p.get("product_name") or "Food").strip(),
-                "grams": g,
-                **x,
-            })
-
+        final = calc({r: round(g/5)*5 for r,g in grams.items()})
         score = (
-            abs(final["kcal"]-target["kcal"]) / max(target["kcal"],1) * 5
+            abs(final["kcal"]-target["kcal"]) / max(target["kcal"],1) * 6
             + abs(final["protein"]-target["protein"]) / max(target["protein"],1) * 3
-            + abs(final["carbs"]-target["carbs"]) / max(target["carbs"],1) * 1.5
-            + abs(final["fat"]-target["fat"]) / max(target["fat"],1) * 1.5
+            + abs(final["carbs"]-target["carbs"]) / max(target["carbs"],1) * 1
+            + abs(final["fat"]-target["fat"]) / max(target["fat"],1) * 1
         )
-        candidates.append((score, items, final))
+        if best is None or score < best[0]:
+            best = (score, {r:round(g/5)*5 for r,g in grams.items()}, chosen, final)
 
-    if not candidates:
+    if best is None:
         return {"items": [], "totals": {"kcal":0,"protein":0,"carbs":0,"fat":0}}
-    candidates.sort(key=lambda x: x[0])
-    _, items, final = candidates[0]
+
+    _, grams, chosen, final = best
+    items = []
+    for role, p in chosen:
+        g = grams[role]
+        x = food_nutrition(p, g)
+        if x["kcal"] <= 0:
+            continue
+        items.append({
+            "role": role,
+            "name": str(p.get("product_name") or "Food").strip(),
+            "grams": g,
+            **x,
+        })
+
+    # Hard guard against the previous 0 kcal issue.
+    if not items or sum(i["kcal"] for i in items) <= 0:
+        p = FALLBACK_FOODS["protein"][0]
+        g = max(50, round(target["kcal"]/food_nutrition(p,100)["kcal"]*100/5)*5)
+        x = food_nutrition(p,g)
+        items = [{"role":"protein","name":p["product_name"],"grams":g,**x}]
+        final = x
+
     return {"items": items, "totals": final}
 
 def make_plan(total_kcal, protein, carbs, fat, meals, mode):
@@ -342,8 +432,8 @@ with st.sidebar:
 # -----------------------------
 # Main tabs
 # -----------------------------
-tab_dash, tab_goal, tab_diet, tab_track, tab_settings = st.tabs(
-    ["🏠 Dashboard", "🎯 Objektivi", "🍽️ Dieta", "⚖️ Tracking", "⚙️ Settings"]
+tab_dash, tab_goal, tab_diet, tab_week, tab_track, tab_settings = st.tabs(
+    ["🏠 Dashboard", "🎯 Objektivi", "🍽️ Dieta", "📅 7 Ditë", "⚖️ Tracking", "⚙️ Settings"]
 )
 
 bmr = calc_bmr(sex, weight, height, age)
@@ -484,6 +574,21 @@ with tab_diet:
                 text.append(f"- {item['name']}: {round(item['grams'])} g")
             text.append("")
         st.download_button("📥 Shkarko planin (.txt)", "\n".join(text), "nutritrack_plan.txt", use_container_width=True)
+
+with tab_week:
+    st.subheader("📅 Plan 7-ditor")
+    if not st.session_state.plan:
+        st.info("Gjenero fillimisht dietën te **Objektivi**.")
+    else:
+        inp = st.session_state.last_inputs
+        st.caption("Versioni bazë përdor të njëjtin target ditor dhe ndryshon kombinimet e ushqimeve.")
+        days = ["E Hënë","E Martë","E Mërkurë","E Enjte","E Premte","E Shtunë","E Diel"]
+        for d_i, day_name in enumerate(days):
+            with st.expander(day_name, expanded=(d_i == 0)):
+                for m_i, meal in enumerate(st.session_state.plan):
+                    # Show compact preview; daily plan remains fast to load.
+                    names = [x["name"] for x in meal["items"]]
+                    st.write(f"**{meal['name']}** · ~{round(meal['totals']['kcal'])} kcal — " + ", ".join(names[:3]))
 
 with tab_track:
     st.subheader("⚖️ Tracking i peshës")
