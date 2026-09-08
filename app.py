@@ -229,6 +229,51 @@ ROLE_CATEGORIES = {
     ],
 }
 
+def food_nutrition(food, grams=100):
+    """Return normalized nutrition for a food at the requested grams.
+    Supports both curated foods and raw Open Food Facts products.
+    """
+    g = max(0.0, num(grams, 100.0))
+    n = food.get("nutriments", {}) or {}
+
+    # Open Food Facts can expose values under several field names.
+    kcal100 = num(food.get("kcal"), num(n.get("energy-kcal_100g"), 0.0))
+    if kcal100 <= 0:
+        # Fallback conversion if only kJ is available.
+        kcal100 = num(n.get("energy_100g"), 0.0) / 4.184
+    p100 = num(food.get("protein"), num(n.get("proteins_100g"), 0.0))
+    c100 = num(food.get("carbs"), num(n.get("carbohydrates_100g"), 0.0))
+    f100 = num(food.get("fat"), num(n.get("fat_100g"), 0.0))
+
+    scale = g / 100.0
+    return {
+        "kcal": kcal100 * scale,
+        "protein": p100 * scale,
+        "carbs": c100 * scale,
+        "fat": f100 * scale,
+    }
+
+def valid_food(food):
+    """Validate a food row without applying meal-specific exclusions.
+    A food can be unusual for a meal and still remain available to the
+    contextual scoring layer.
+    """
+    if not isinstance(food, dict):
+        return False
+    name = str(food.get("product_name") or "").strip()
+    if not name:
+        return False
+    n = food_nutrition(food, 100)
+    # Require usable energy data; zero-calorie rows are generally incomplete
+    # Open Food Facts records rather than real foods for this optimizer.
+    if n["kcal"] <= 0:
+        return False
+    # Reject impossible negative macro values, but do not reject foods merely
+    # because their nutrition is imperfect or incomplete.
+    if any(n[k] < 0 for k in ("protein", "carbs", "fat")):
+        return False
+    return True
+
 def healthy_ok(p):
     grade = str(p.get("nutriscore_grade") or "").lower()
     n = p.get("nutriments", {}) or {}
