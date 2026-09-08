@@ -245,8 +245,9 @@ def get_food_pool(role, mode):
     products = []
     for cat in ROLE_CATEGORIES[role]:
         products.extend(api_category_search(cat))
-        if len(products) >= 140:
+        if len(products) >= 160:
             break
+
     seen = set()
     out = []
     for p in products:
@@ -255,17 +256,77 @@ def get_food_pool(role, mode):
             continue
         if mode == "Healthy" and not healthy_ok(p):
             continue
+        n = food_nutrition(p, 100)
+        # Normalize API products to the same shape as curated foods.
+        item = {
+            "product_name": name,
+            "kcal": n["kcal"],
+            "protein": n["protein"],
+            "carbs": n["carbs"],
+            "fat": n["fat"],
+        }
         seen.add(name.lower())
-        out.append(p)
+        out.append(item)
 
-    # Always merge curated foods so the generator remains functional.
     for f in FALLBACK_FOODS[role]:
         if mode == "Healthy" and f["kcal"] > 650 and role != "fat":
             continue
         if f["product_name"].lower() not in seen:
-            out.append(f)
+            out.append(f.copy())
             seen.add(f["product_name"].lower())
     return out
+
+# Meal logic is intentionally stricter than the generic food categories.
+# A generic "protein" pool must NOT be allowed to decide what belongs at breakfast/snack.
+MEAL_ROLE_RULES = {
+    "Mëngjes": ["breakfast_protein", "breakfast_carb", "fruit", "fat"],
+    "Drekë": ["main_protein", "carb", "vegetable", "fat"],
+    "Snack": ["snack_protein", "fruit"],
+    "Darkë": ["main_protein", "vegetable", "carb", "fat"],
+    "Snack 2": ["snack_protein", "fruit"],
+    "Vakt 6": ["light_protein", "vegetable", "carb"],
+}
+
+MEAL_POOL_BASE = {
+    "breakfast_protein": "protein",
+    "breakfast_carb": "carb",
+    "snack_protein": "protein",
+    "main_protein": "protein",
+    "light_protein": "protein",
+    "fruit": "fruit",
+    "carb": "carb",
+    "vegetable": "vegetable",
+    "fat": "fat",
+}
+
+# Keywords are used as an additional safety layer on top of Open Food Facts categories.
+EXCLUDE_BY_MEAL_ROLE = {
+    "breakfast_protein": ["viçi", "beef", "steak", "chicken", "pule", "salmon", "ton", "tuna", "fish", "peshk"],
+    "snack_protein": ["viçi", "beef", "steak", "chicken", "pule", "salmon", "ton", "tuna", "fish", "peshk"],
+    "light_protein": ["viçi", "beef", "steak", "chicken", "pule", "salmon", "ton", "tuna", "fish", "peshk"],
+}
+
+PREFERRED_BY_MEAL_ROLE = {
+    "breakfast_protein": ["vezë", "egg", "kos", "yogurt", "skyr", "gjizë", "cottage"],
+    "snack_protein": ["kos", "yogurt", "skyr", "gjizë", "cottage"],
+    "light_protein": ["kos", "yogurt", "skyr", "gjizë", "cottage", "vezë", "egg"],
+}
+
+def get_meal_pool(meal_role, mode):
+    base = get_food_pool(MEAL_POOL_BASE[meal_role], mode)
+    excludes = EXCLUDE_BY_MEAL_ROLE.get(meal_role, [])
+    preferred = PREFERRED_BY_MEAL_ROLE.get(meal_role, [])
+
+    def has_any(name, words):
+        n = name.lower()
+        return any(w in n for w in words)
+
+    filtered = [f for f in base if not has_any(f["product_name"], excludes)]
+    if preferred:
+        preferred_items = [f for f in filtered if has_any(f["product_name"], preferred)]
+        if preferred_items:
+            filtered = preferred_items + [f for f in filtered if f not in preferred_items]
+    return filtered
 
 def food_nutrition(p, grams):
     n = p.get("nutriments", {}) or {}
@@ -326,19 +387,17 @@ def _dedupe_pool(pool):
         k = _food_key(f)
         if not k or k in seen:
             continue
-        kcal = num(f.get("kcal"))
-        if kcal <= 0:
+        if num(f.get("kcal")) <= 0:
             continue
         seen.add(k)
         out.append(f)
     return out
 
 def _portion_candidates(food, role):
-    # Practical portions. The optimizer chooses among these discrete quantities.
-    if role == "protein":
+    if role in {"breakfast_protein", "main_protein", "snack_protein", "light_protein"}:
         grams = [80, 100, 120, 140, 160, 180, 200]
-    elif role == "carb":
-        grams = [60, 80, 100, 120, 150, 180, 200]
+    elif role in {"breakfast_carb", "carb"}:
+        grams = [50, 60, 80, 100, 120, 150, 180, 200]
     elif role == "vegetable":
         grams = [100, 150, 200, 250, 300]
     elif role == "fruit":
@@ -349,225 +408,115 @@ def _portion_candidates(food, role):
 
 def _nutrition_for(food, grams):
     scale = grams / 100.0
-    return {
-        "kcal": num(food.get("kcal")) * scale,
-        "protein": num(food.get("protein")) * scale,
-        "carbs": num(food.get("carbs")) * scale,
-        "fat": num(food.get("fat")) * scale,
-    }
+    return {k: num(food.get(k)) * scale for k in ["kcal", "protein", "carbs", "fat"]}
 
 def _solve_combo(candidates, target, target_p, target_c, target_f, used_names):
-    """
-    Mixed-integer selection over discrete food portions.
-    Each candidate is one (food, grams) option. At most one portion per role.
-    Objective is a weighted distance from calorie/macro targets plus repetition.
-    """
-    if not candidates:
+    if not candidates or not SCIPY_OK:
         return []
-
-    # Keep the problem small enough for Streamlit while retaining alternatives.
-    candidates = candidates[:80]
-
-    if not SCIPY_OK:
-        # Deterministic greedy fallback, not random.
-        chosen = []
-        totals = {"kcal": 0, "protein": 0, "carbs": 0, "fat": 0}
-        roles_seen = set()
-        for item in sorted(
-            candidates,
-            key=lambda x: (
-                _food_key(x["food"]) in used_names,
-                abs(x["nut"]["kcal"] - target / max(1, len(set(i["role"] for i in candidates)))),
-            ),
-        ):
-            if item["role"] in roles_seen:
-                continue
-            chosen.append(item)
-            roles_seen.add(item["role"])
-            for k in totals:
-                totals[k] += item["nut"][k]
-        return chosen
-
+    candidates = candidates[:160]
     n = len(candidates)
-    # Binary variable for each discrete option.
-    c = np.zeros(n)
+    roles = list(dict.fromkeys(item["role"] for item in candidates))
+    # x = binary food/portion choices; d+/d- = absolute macro deviations.
+    nv = n + 8
+    c = np.zeros(nv)
     for i, item in enumerate(candidates):
-        nut = item["nut"]
-        repeat_penalty = 120.0 if _food_key(item["food"]) in used_names else 0.0
-        c[i] = (
-            abs(nut["kcal"] - target / 2.0) * 0.010
-            + abs(nut["protein"] - target_p / 2.0) * 0.12
-            + abs(nut["carbs"] - target_c / 2.0) * 0.035
-            + abs(nut["fat"] - target_f / 2.0) * 0.06
-            + repeat_penalty
-        )
+        c[i] = 3.0 * (item["role"] in {"fat"}) + 12.0 * (_food_key(item["food"]) in used_names)
+    # Deviation weights: kcal strongest, then protein, carbs, fat.
+    c[n:n+2] = 1.00
+    c[n+2:n+4] = 7.0
+    c[n+4:n+6] = 2.0
+    c[n+6:n+8] = 2.0
 
-    A = np.zeros((4, n))
-    for i, item in enumerate(candidates):
-        A[0, i] = item["nut"]["kcal"]
-        A[1, i] = item["nut"]["protein"]
-        A[2, i] = item["nut"]["carbs"]
-        A[3, i] = item["nut"]["fat"]
-
-    # Meal-level ranges. Calories are kept tight; macros are soft via objective.
-    lower = np.array([max(80, target * 0.82), max(0, target_p * 0.55), 0, 0])
-    upper = np.array([target * 1.12, max(30, target_p * 1.45), max(10, target_c * 1.45), max(8, target_f * 1.45)])
-
-    constraints = [LinearConstraint(A, lower, upper)]
-
-    # At most one selected portion for each role.
-    roles = sorted(set(item["role"] for item in candidates))
-    role_A = np.zeros((len(roles), n))
+    Aeq = []
+    beq = []
+    role_A = np.zeros((len(roles), nv))
     for r, role in enumerate(roles):
         for i, item in enumerate(candidates):
             if item["role"] == role:
                 role_A[r, i] = 1
-    constraints.append(LinearConstraint(role_A, np.zeros(len(roles)), np.ones(len(roles))))
+        Aeq.append(role_A[r]); beq.append(1)
 
+    # Nutrient equations with positive/negative deviation variables.
+    nutrient_targets = [target, target_p, target_c, target_f]
+    nutrient_rows = []
+    for j, key in enumerate(["kcal", "protein", "carbs", "fat"]):
+        row = np.zeros(nv)
+        for i, item in enumerate(candidates):
+            row[i] = item["nut"][key]
+        row[n + 2*j] = 1
+        row[n + 2*j + 1] = -1
+        nutrient_rows.append(row)
+        Aeq.append(row); beq.append(nutrient_targets[j])
+
+    Aeq = np.array(Aeq)
+    beq = np.array(beq)
+    lb = np.zeros(nv)
+    ub = np.ones(nv)
+    ub[n:] = np.inf
     result = milp(
         c=c,
-        integrality=np.ones(n),
-        bounds=Bounds(np.zeros(n), np.ones(n)),
-        constraints=constraints,
-        options={"time_limit": 1.5},
+        integrality=np.r_[np.ones(n), np.zeros(8)],
+        bounds=Bounds(lb, ub),
+        constraints=LinearConstraint(Aeq, beq, beq),
+        options={"time_limit": 2.0},
     )
     if not result.success or result.x is None:
         return []
+    return [candidates[i] for i, x in enumerate(result.x[:n]) if x > 0.5]
 
-    return [candidates[i] for i, x in enumerate(result.x) if x > 0.5]
+def _greedy_combo(candidates, target, target_p, target_c, target_f, used_names):
+    chosen = []
+    for role in dict.fromkeys(x["role"] for x in candidates):
+        pool = [x for x in candidates if x["role"] == role]
+        pool.sort(key=lambda x: ( _food_key(x["food"]) in used_names,
+            abs(x["nut"]["kcal"] - target / max(1, len(set(i["role"] for i in candidates)))) ))
+        if pool:
+            chosen.append(pool[0])
+    return chosen
 
 def build_meal(meal_name, target_kcal, target_p, target_c, target_f, food_mode, used_names=None, seed=0):
     used_names = set(used_names or [])
-    roles = MEAL_ROLE_RULES.get(meal_name, ["protein", "carb", "vegetable"])
-
+    roles = MEAL_ROLE_RULES.get(meal_name, ["main_protein", "carb", "vegetable"])
     all_candidates = []
     for role in roles:
-        pool = _dedupe_pool(get_food_pool(role, food_mode))
-        # Never allow a repeated exact food in the same day if alternatives exist.
+        pool = _dedupe_pool(get_meal_pool(role, food_mode))
         fresh = [f for f in pool if _food_key(f) not in used_names]
-        if len(fresh) >= 2:
+        if fresh:
             pool = fresh
-
-        for food in pool[:20]:
+        for food in pool[:28]:
             for grams in _portion_candidates(food, role):
-                all_candidates.append({
-                    "food": food,
-                    "role": role,
-                    "grams": grams,
-                    "nut": _nutrition_for(food, grams),
-                })
+                all_candidates.append({"food": food, "role": role, "grams": grams, "nut": _nutrition_for(food, grams)})
 
-    # Try several target weightings; choose the best complete meal.
-    best = None
-    best_score = float("inf")
-    attempts = [
-        (1.0, 1.0, 1.0, 1.0),
-        (1.25, 1.15, 0.9, 0.9),
-        (1.5, 1.0, 0.75, 0.75),
-    ]
-    for wk, wp, wc, wf in attempts:
-        chosen = _solve_combo(
-            all_candidates,
-            target_kcal * wk,
-            target_p * wp,
-            target_c * wc,
-            target_f * wf,
-            used_names,
-        )
-        if not chosen:
-            continue
+    chosen = _solve_combo(all_candidates, target_kcal, target_p, target_c, target_f, used_names)
+    if not chosen:
+        chosen = _greedy_combo(all_candidates, target_kcal, target_p, target_c, target_f, used_names)
 
-        totals = {k: sum(x["nut"][k] for x in chosen) for k in ["kcal", "protein", "carbs", "fat"]}
-        repetition = sum(_food_key(x["food"]) in used_names for x in chosen)
-        score = (
-            abs(totals["kcal"] - target_kcal) / max(target_kcal, 1) * 100
-            + abs(totals["protein"] - target_p) / max(target_p, 1) * 40
-            + abs(totals["carbs"] - target_c) / max(target_c, 1) * 15
-            + abs(totals["fat"] - target_f) / max(target_f, 1) * 15
-            + repetition * 100
-        )
-        # Penalize implausibly tiny meals and over-complex meals.
-        if len(chosen) > 4:
-            score += (len(chosen) - 4) * 8
-        if score < best_score:
-            best_score = score
-            best = chosen
+    # Enforce meal identity even if the optimizer/fallback had insufficient data.
+    if not chosen:
+        raise RuntimeError(f"Nuk u gjet kombinim ushqimesh për {meal_name}.")
 
-    if not best:
-        # Guaranteed non-zero fallback.
-        fallback = FALLBACK_FOODS["protein"][0]
-        grams = max(80, round(target_kcal / max(fallback["kcal"], 1) * 100))
-        best = [{"food": fallback, "role": "protein", "grams": grams, "nut": _nutrition_for(fallback, grams)}]
-
+    totals = {k: sum(x["nut"][k] for x in chosen) for k in ["kcal", "protein", "carbs", "fat"]}
     return {
         "name": meal_name,
-        "items": [
-            {
-                "name": x["food"].get("product_name", "Ushqim"),
-                "role": x["role"],
-                "grams": x["grams"],
-                "kcal": round(x["nut"]["kcal"]),
-                "protein": round(x["nut"]["protein"], 1),
-                "carbs": round(x["nut"]["carbs"], 1),
-                "fat": round(x["nut"]["fat"], 1),
-            }
-            for x in best
-        ],
-        "totals": {
-            "kcal": round(sum(x["nut"]["kcal"] for x in best)),
-            "protein": round(sum(x["nut"]["protein"] for x in best), 1),
-            "carbs": round(sum(x["nut"]["carbs"] for x in best), 1),
-            "fat": round(sum(x["nut"]["fat"] for x in best), 1),
-        },
+        "target": target_kcal,
+        "items": [{
+            "name": x["food"]["product_name"], "role": x["role"], "grams": round(x["grams"]),
+            "kcal": round(x["nut"]["kcal"]), "protein": round(x["nut"]["protein"], 1),
+            "carbs": round(x["nut"]["carbs"], 1), "fat": round(x["nut"]["fat"], 1)
+        } for x in chosen],
+        "totals": {"kcal": round(totals["kcal"]), "protein": round(totals["protein"], 1),
+                   "carbs": round(totals["carbs"], 1), "fat": round(totals["fat"], 1)}
     }
 
 def make_plan(target_kcal, target_p, target_c, target_f, meal_count, food_mode, seed=0):
     meal_names = ["Mëngjes", "Drekë", "Snack", "Darkë", "Snack 2", "Vakt 6"][:meal_count]
-    distributions = {
-        2: [0.45, 0.55],
-        3: [0.25, 0.40, 0.35],
-        4: [0.22, 0.33, 0.18, 0.27],
-        5: [0.20, 0.30, 0.15, 0.20, 0.15],
-        6: [0.18, 0.25, 0.12, 0.18, 0.15, 0.12],
-    }[meal_count]
-
+    distributions = {2:[0.45,0.55],3:[0.25,0.40,0.35],4:[0.22,0.33,0.18,0.27],5:[0.20,0.30,0.15,0.20,0.15],6:[0.18,0.25,0.12,0.18,0.15,0.12]}[meal_count]
     used_names = set()
     meals = []
     for name, share in zip(meal_names, distributions):
-        meal = build_meal(
-            name,
-            target_kcal * share,
-            target_p * share,
-            target_c * share,
-            target_f * share,
-            food_mode,
-            used_names=used_names,
-            seed=seed,
-        )
+        meal = build_meal(name, target_kcal*share, target_p*share, target_c*share, target_f*share, food_mode, used_names=used_names, seed=seed)
         meals.append(meal)
-        for item in meal["items"]:
-            used_names.add(item["name"].strip().lower())
-
-    # Global repair pass: if a food repeats despite alternatives, regenerate the later meal.
-    seen = set()
-    for idx, meal in enumerate(meals):
-        repeated = any(item["name"].strip().lower() in seen for item in meal["items"])
-        if repeated:
-            share = distributions[idx]
-            repaired = build_meal(
-                meal["name"],
-                target_kcal * share,
-                target_p * share,
-                target_c * share,
-                target_f * share,
-                food_mode,
-                used_names=seen,
-                seed=seed + idx + 100,
-            )
-            meals[idx] = repaired
-        for item in meals[idx]["items"]:
-            seen.add(item["name"].strip().lower())
-
+        used_names.update(item["name"].strip().lower() for item in meal["items"])
     return meals
 
 def plan_totals(plan):
@@ -733,7 +682,7 @@ with tab_diet:
                 if st.button("🔄 Rigjenero këtë vakt", key=f"regen_{i}", use_container_width=True):
                     st.session_state.meal_seeds[i] = random.randint(1, 10_000_000)
                     target = meal["target"]
-                    new_meal = build_meal(target, inp["food_mode"], i, st.session_state.meal_seeds[i])
+                    new_meal = build_meal(meal["name"], meal["target"], inp["protein"] * (meal["target"] / inp["kcal"]), inp["carbs"] * (meal["target"] / inp["kcal"]), inp["fat"] * (meal["target"] / inp["kcal"]), inp["food_mode"], used_names=set(), seed=st.session_state.meal_seeds[i])
                     new_meal["name"] = meal["name"]
                     new_meal["target"] = target
                     st.session_state.plan[i] = new_meal
