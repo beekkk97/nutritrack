@@ -264,6 +264,7 @@ def get_food_pool(role, mode):
             "protein": n["protein"],
             "carbs": n["carbs"],
             "fat": n["fat"],
+            "serving_g": num(p.get("serving_quantity")),
         }
         seen.add(name.lower())
         out.append(item)
@@ -276,8 +277,8 @@ def get_food_pool(role, mode):
             seen.add(f["product_name"].lower())
     return out
 
-# Meal intelligence: foods are not globally deleted. The engine scores how natural
-# each food is for a meal/role and lets the optimizer decide.
+# Meal logic is intentionally stricter than the generic food categories.
+# A generic "protein" pool must NOT be allowed to decide what belongs at breakfast/snack.
 MEAL_ROLE_RULES = {
     "Mëngjes": ["breakfast_protein", "breakfast_carb", "fruit", "fat"],
     "Drekë": ["main_protein", "carb", "vegetable", "fat"],
@@ -286,87 +287,134 @@ MEAL_ROLE_RULES = {
     "Snack 2": ["snack_protein", "fruit"],
     "Vakt 6": ["light_protein", "vegetable", "carb"],
 }
+
 MEAL_POOL_BASE = {
-    "breakfast_protein":"protein", "breakfast_carb":"carb", "snack_protein":"protein",
-    "main_protein":"protein", "light_protein":"protein", "fruit":"fruit",
-    "carb":"carb", "vegetable":"vegetable", "fat":"fat",
+    "breakfast_protein": "protein", "breakfast_carb": "carb",
+    "snack_protein": "protein", "main_protein": "protein",
+    "light_protein": "protein", "fruit": "fruit", "carb": "carb",
+    "vegetable": "vegetable", "fat": "fat",
 }
 
-def _food_family(food):
+# This is deliberately a SOFT logic layer. Foods are never globally deleted just
+# because they are unusual for a meal. The planner scores contextual suitability.
+FOOD_GROUP_HINTS = {
+    "animal_meat": ["beef", "viçi", "mish", "steak", "chicken", "pule", "turkey", "gjeldeti", "pork", "derri", "lamb", "qengj"],
+    "fish": ["fish", "peshk", "salmon", "salmon", "tuna", "ton", "sardine", "sardele", "cod", "merluc"],
+    "egg": ["egg", "vezë", "veze"],
+    "dairy": ["yogurt", "kos", "skyr", "gjizë", "cottage", "qumësht", "milk", "cheese", "djath"],
+    "grain": ["rice", "oriz", "oat", "tërsh", "pasta", "makarona", "bread", "bukë", "quinoa", "couscous", "bulgur"],
+    "fruit": ["banana", "banane", "apple", "mollë", "orange", "portokall", "berry", "berries", "manafer", "strawberry", "luleshtrydhe", "blueberry", "raspberry", "fruit", "frut"],
+    "vegetable": ["broccoli", "tomato", "domat", "carrot", "karot", "pepper", "spec", "salad", "sallat", "vegetable", "perime", "spinach", "spinaq", "cucumber", "kastravec"],
+    "fat_dense": ["olive oil", "vaj ulliri", "almond", "bajame", "walnut", "arra", "avocado", "avokado", "chia", "seed", "fara", "peanut", "kikirik"],
+}
+
+MEAL_PREFERENCES = {
+    "Mëngjes": {
+        "breakfast_protein": {"egg": 7, "dairy": 6, "animal_meat": -8, "fish": -9},
+        "breakfast_carb": {"grain": 7, "fruit": 1},
+        "fruit": {"fruit": 8}, "fat": {"fat_dense": 5},
+    },
+    "Drekë": {
+        "main_protein": {"animal_meat": 8, "fish": 8, "egg": 3, "dairy": 1},
+        "carb": {"grain": 7}, "vegetable": {"vegetable": 8}, "fat": {"fat_dense": 4},
+    },
+    "Snack": {
+        "snack_protein": {"dairy": 8, "egg": 4, "animal_meat": -8, "fish": -8},
+        "fruit": {"fruit": 8},
+    },
+    "Darkë": {
+        "main_protein": {"animal_meat": 7, "fish": 8, "egg": 3, "dairy": 1},
+        "vegetable": {"vegetable": 8}, "carb": {"grain": 5}, "fat": {"fat_dense": 3},
+    },
+    "Snack 2": {
+        "snack_protein": {"dairy": 8, "egg": 4, "animal_meat": -8, "fish": -8},
+        "fruit": {"fruit": 8},
+    },
+    "Vakt 6": {
+        "light_protein": {"dairy": 7, "egg": 4, "animal_meat": -5, "fish": -4},
+        "vegetable": {"vegetable": 7}, "carb": {"grain": 4},
+    },
+}
+
+ROLE_DEFAULT_PORTIONS = {
+    "breakfast_protein": (80, 220), "main_protein": (80, 220),
+    "snack_protein": (80, 220), "light_protein": (70, 200),
+    "breakfast_carb": (25, 100), "carb": (50, 180),
+    "vegetable": (100, 300), "fruit": (60, 180), "fat": (5, 30),
+}
+
+FOOD_PORTION_PROFILES = {
+    "egg": [50, 100, 150, 200],
+    "dairy": [100, 150, 170, 200, 250],
+    "grain_oat": [30, 40, 50, 60, 70, 80],
+    "bread": [40, 60, 80, 100, 120],
+    "banana": [80, 100, 120, 150],
+    "apple": [120, 150, 180, 200],
+    "orange": [120, 150, 180, 200],
+    "berries": [60, 80, 100, 120],
+    "vegetable": [100, 150, 200, 250, 300],
+    "fat": [5, 10, 15, 20, 25, 30],
+}
+
+def _food_group(food):
     n = _food_key(food)
-    if any(x in n for x in ["egg", "vezë"]): return "egg"
-    if any(x in n for x in ["kos", "yogurt", "skyr", "gjizë", "cottage", "quark"]): return "dairy"
-    if any(x in n for x in ["chicken", "pule", "turkey", "gjel", "beef", "viçi", "steak", "mish"]): return "meat"
-    if any(x in n for x in ["fish", "peshk", "salmon", "tuna", "ton", "sardine"]): return "fish"
-    if any(x in n for x in ["rice", "oriz", "oat", "tërsh", "bread", "bukë", "pasta", "makar", "potato", "patate", "quinoa"]): return "grain_starch"
-    if any(x in n for x in ["broccoli", "domat", "tomato", "carrot", "karrot", "pepper", "spec", "salad", "sallat", "vegetable", "perime"]): return "vegetable"
-    if any(x in n for x in ["banana", "banane", "apple", "mollë", "orange", "portokall", "berry", "berries", "manaferra"]): return "fruit"
-    if any(x in n for x in ["olive oil", "vaj ulliri", "almond", "bajame", "walnut", "arra", "avocado", "avokado", "chia", "seed", "fara"]): return "fat_dense"
-    return "other"
+    for group, words in FOOD_GROUP_HINTS.items():
+        if any(w in n for w in words):
+            return group
+    return "unknown"
 
-ROLE_FAMILY_SCORE = {
-    "breakfast_protein":{"egg":12,"dairy":10,"meat":-22,"fish":-25},
-    "snack_protein":{"dairy":12,"egg":5,"meat":-28,"fish":-30},
-    "light_protein":{"dairy":10,"egg":6,"meat":-12,"fish":-15},
-    "main_protein":{"meat":9,"fish":9,"egg":3,"dairy":2},
-}
-
-def meal_compatibility(meal_name, role, food):
-    family = _food_family(food)
-    score = ROLE_FAMILY_SCORE.get(role, {}).get(family, 0)
-    if role in {"breakfast_carb","carb"}: score += {"grain_starch":8}.get(family,0)
-    if role == "fruit": score += {"fruit":14}.get(family,0)
-    if role == "vegetable": score += {"vegetable":14}.get(family,0)
-    if role == "fat": score += {"fat_dense":10}.get(family,0)
-    if meal_name in {"Mëngjes","Snack","Snack 2"} and family in {"meat","fish"}: score -= 10
-    if meal_name in {"Drekë","Darkë"} and family in {"meat","fish"}: score += 4
+def _meal_fit(meal_name, role, food):
+    group = _food_group(food)
+    score = MEAL_PREFERENCES.get(meal_name, {}).get(role, {}).get(group, 0)
+    # General semantic rules: avoid duplicate heavy roles and reward the intended family.
+    if role in {"fruit"} and group != "fruit": score -= 12
+    if role == "vegetable" and group != "vegetable": score -= 12
+    if role == "fat" and group != "fat_dense": score -= 10
+    if role in {"breakfast_carb", "carb"} and group not in {"grain", "fruit"}: score -= 6
+    if role in {"breakfast_protein", "snack_protein", "light_protein"} and group in {"animal_meat", "fish"}: score -= 10
+    # Dense foods should not dominate snacks/breakfast.
+    if role == "fat" and food_nutrition(food, 100)["kcal"] > 750: score -= 2
     return score
 
-def get_meal_pool(meal_role, mode):
-    # No hard food deletion here. The optimizer handles meal compatibility.
-    return _dedupe_pool(get_food_pool(MEAL_POOL_BASE[meal_role], mode))
+def _food_serving_anchor(food):
+    # Open Food Facts serving_quantity is optional; use it only as a soft anchor.
+    q = num(food.get("serving_g") or food.get("serving_quantity"))
+    if 20 <= q <= 500:
+        return q
+    return None
 
-def food_nutrition(p, grams):
-    n = p.get("nutriments", {}) or {}
-    if n:
-        kcal = num(n.get("energy-kcal_100g") or n.get("energy-kcal"))
-        protein = num(n.get("proteins_100g"))
-        carbs = num(n.get("carbohydrates_100g"))
-        fat = num(n.get("fat_100g"))
+def _portion_candidates(food, role):
+    name = _food_key(food)
+    anchor = _food_serving_anchor(food)
+    group = _food_group(food)
+    if "egg" == group or "vez" in name:
+        vals = FOOD_PORTION_PROFILES["egg"]
+    elif group == "dairy":
+        vals = FOOD_PORTION_PROFILES["dairy"]
+    elif "bread" in name or "bukë" in name:
+        vals = FOOD_PORTION_PROFILES["bread"]
+    elif "oat" in name or "tërsh" in name:
+        vals = FOOD_PORTION_PROFILES["grain_oat"]
+    elif group == "fruit":
+        if "banana" in name or "banane" in name: vals = FOOD_PORTION_PROFILES["banana"]
+        elif "apple" in name or "mollë" in name: vals = FOOD_PORTION_PROFILES["apple"]
+        elif "orange" in name or "portokall" in name: vals = FOOD_PORTION_PROFILES["orange"]
+        elif any(x in name for x in ["berry", "berries", "manafer", "strawberry", "blueberry", "raspberry", "luleshtrydhe"]): vals = FOOD_PORTION_PROFILES["berries"]
+        else: vals = [80, 100, 120, 150]
+    elif role == "vegetable" or group == "vegetable":
+        vals = FOOD_PORTION_PROFILES["vegetable"]
+    elif role == "fat" or group == "fat_dense":
+        vals = FOOD_PORTION_PROFILES["fat"]
     else:
-        kcal = num(p.get("kcal"))
-        protein = num(p.get("protein"))
-        carbs = num(p.get("carbs"))
-        fat = num(p.get("fat"))
-    return {
-        "kcal": kcal*grams/100,
-        "protein": protein*grams/100,
-        "carbs": carbs*grams/100,
-        "fat": fat*grams/100,
-    }
+        vals = [80, 100, 120, 140, 160, 180, 200]
+    if anchor:
+        # Add serving anchor and nearby practical values without making it mandatory.
+        vals = sorted(set(vals + [round(anchor/10)*10]))
+    return vals
 
-def valid_food(p):
-    x = food_nutrition(p, 100)
-    return (
-        bool(str(p.get("product_name") or "").strip())
-        and x["kcal"] > 0
-        and (x["protein"] + x["carbs"] + x["fat"]) > 0
-    )
+def get_meal_pool(meal_role, mode):
+    return get_food_pool(MEAL_POOL_BASE[meal_role], mode)
 
-def pick(pool, seed):
-    if not pool:
-        return None
-    rng = random.Random(seed)
-    return rng.choice(pool)
-
-
-# Foods are selected with hard constraints first and soft objectives second.
-# The optimizer prefers:
-# 1) kcal target
-# 2) protein target
-# 3) macro balance
-# 4) practical serving sizes
-# 5) variety / low repetition
 def _food_key(food):
     return str(food.get("product_name", "")).strip().lower()
 
@@ -374,101 +422,124 @@ def _dedupe_pool(pool):
     out, seen = [], set()
     for f in pool:
         k = _food_key(f)
-        if not k or k in seen or not valid_food(f): continue
+        if not k or k in seen or not valid_food(f):
+            continue
         seen.add(k); out.append(f)
     return out
 
-def _typical_portion(food, role):
-    q = num(food.get("serving_quantity"), 0)
-    if 20 <= q <= 500: return q
-    return {"egg":100,"dairy":170,"meat":140,"fish":140,"grain_starch":100,
-            "vegetable":180,"fruit":120,"fat_dense":15}.get(_food_family(food),100)
-
-def _portion_candidates(food, role):
-    name = _food_key(food); family = _food_family(food)
-    if family == "egg": return [50,100,150,200]
-    if family == "dairy": return [100,150,170,200,250]
-    if role in {"breakfast_protein","main_protein","snack_protein","light_protein"}: return [80,100,120,140,160,180,200]
-    if role in {"breakfast_carb","carb"}:
-        if "bukë" in name or "bread" in name: return [40,60,80,100,120]
-        if "tërsh" in name or "oat" in name: return [30,40,50,60,70,80]
-        return [60,80,100,120,150,180,200]
-    if role == "vegetable": return [100,150,180,200,250,300]
-    if role == "fruit":
-        if "berry" in name or "berries" in name or "manaferra" in name: return [60,80,100,120]
-        if "banana" in name or "banane" in name: return [80,100,120,150]
-        if any(x in name for x in ["apple","mollë","orange","portokall"]): return [120,150,180,200]
-        return [80,100,120,150]
-    return [5,10,15,20,25,30]
-
 def _nutrition_for(food, grams):
-    scale=grams/100.0
-    return {k:num(food.get(k))*scale for k in ["kcal","protein","carbs","fat"]}
+    return food_nutrition(food, grams)
 
-def _candidate_penalty(meal_name, item, used_names):
-    family=_food_family(item["food"]); score=meal_compatibility(meal_name,item["role"],item["food"])
-    typical=_typical_portion(item["food"],item["role"])
-    portion_penalty=abs(item["grams"]-typical)/max(typical,1)*3.0
-    repeat_penalty=18 if _food_key(item["food"]) in used_names else 0
-    density=num(item["food"].get("kcal")); density_penalty=0
-    if item["role"]=="vegetable" and density>150: density_penalty=5
-    if item["role"]=="fruit" and density>250: density_penalty=4
-    if item["role"]=="fat" and family!="fat_dense": density_penalty=4
-    return -score+portion_penalty+repeat_penalty+density_penalty
-
-def _solve_combo(meal_name,candidates,target,target_p,target_c,target_f,used_names):
+def _solve_combo(candidates, target, target_p, target_c, target_f, used_names):
     if not candidates or not SCIPY_OK: return []
-    candidates=candidates[:220]; roles=list(dict.fromkeys(x["role"] for x in candidates)); n=len(candidates); nv=n+8
-    c=np.zeros(nv)
-    for i,item in enumerate(candidates): c[i]=_candidate_penalty(meal_name,item,used_names)*0.9
-    c[n:n+2]=1.0; c[n+2:n+4]=8.0; c[n+4:n+6]=2.5; c[n+6:n+8]=2.5
+    roles = list(dict.fromkeys(x["role"] for x in candidates))
+    n = len(candidates); nv = n + 8
+    c = np.zeros(nv)
+    for i, item in enumerate(candidates):
+        repetition = 8.0 if _food_key(item["food"]) in used_names else 0.0
+        # Compatibility is a strong objective, but nutrition deviation remains dominant.
+        c[i] = -2.8 * item["fit"] + repetition + (0.8 if item["role"] == "fat" else 0)
+    c[n:n+2] = 1.00; c[n+2:n+4] = 7.0; c[n+4:n+6] = 2.0; c[n+6:n+8] = 2.0
     Aeq=[]; beq=[]
     for role in roles:
         row=np.zeros(nv)
-        for i,item in enumerate(candidates):
-            if item["role"]==role: row[i]=1
+        for i,x in enumerate(candidates):
+            if x["role"]==role: row[i]=1
         Aeq.append(row); beq.append(1)
-    targets=[target,target_p,target_c,target_f]
     for j,key in enumerate(["kcal","protein","carbs","fat"]):
         row=np.zeros(nv)
-        for i,item in enumerate(candidates): row[i]=item["nut"][key]
-        row[n+2*j]=1; row[n+2*j+1]=-1; Aeq.append(row); beq.append(targets[j])
+        for i,x in enumerate(candidates): row[i]=x["nut"][key]
+        row[n+2*j]=1; row[n+2*j+1]=-1
+        Aeq.append(row); beq.append([target,target_p,target_c,target_f][j])
     lb=np.zeros(nv); ub=np.ones(nv); ub[n:]=np.inf
-    result=milp(c=c,integrality=np.r_[np.ones(n),np.zeros(8)],bounds=Bounds(lb,ub),
-        constraints=LinearConstraint(np.array(Aeq),np.array(beq),np.array(beq)),options={"time_limit":2.0})
+    result=milp(c=c, integrality=np.r_[np.ones(n),np.zeros(8)], bounds=Bounds(lb,ub),
+                constraints=LinearConstraint(np.array(Aeq),np.array(beq),np.array(beq)), options={"time_limit":2.0})
     if not result.success or result.x is None: return []
     return [candidates[i] for i,x in enumerate(result.x[:n]) if x>0.5]
 
-def _greedy_combo(meal_name,candidates,target,target_p,target_c,target_f,used_names):
+def _meal_quality(meal_name, chosen):
+    if not chosen: return -999
+    score=sum(x["fit"] for x in chosen)
+    groups=[_food_group(x["food"]) for x in chosen]
+    # Pairing bonuses: these make the output resemble a coherent human meal.
+    if meal_name in {"Mëngjes"}:
+        if "dairy" in groups and "grain" in groups: score += 5
+        if "egg" in groups and "grain" in groups: score += 5
+        if "fruit" in groups: score += 3
+        if "animal_meat" in groups or "fish" in groups: score -= 18
+    if meal_name in {"Drekë","Darkë"}:
+        if any(g in groups for g in ["animal_meat","fish","egg"]) and "vegetable" in groups: score += 5
+        if "grain" in groups: score += 3
+    if meal_name.startswith("Snack"):
+        if "fruit" in groups and ("dairy" in groups or "egg" in groups): score += 6
+        if "animal_meat" in groups or "fish" in groups: score -= 18
+    # Penalize two dense-fat choices or a pile-up of heavy proteins.
+    if groups.count("fat_dense") > 1: score -= 8
+    heavy=sum(g in {"animal_meat","fish","egg"} for g in groups)
+    if heavy > 1: score -= 4
+    return score
+
+def _greedy_combo(candidates, target, target_p, target_c, target_f, used_names):
     chosen=[]
     for role in dict.fromkeys(x["role"] for x in candidates):
-        pool=[x for x in candidates if x["role"]==role]; pool.sort(key=lambda x:_candidate_penalty(meal_name,x,used_names))
+        pool=[x for x in candidates if x["role"]==role]
+        pool.sort(key=lambda x: (-(x["fit"]), _food_key(x["food"]) in used_names, abs(x["nut"]["kcal"]-target/max(1,len(set(i["role"] for i in candidates))))))
         if pool: chosen.append(pool[0])
     return chosen
 
-def build_meal(meal_name,target_kcal,target_p,target_c,target_f,food_mode,used_names=None,seed=0):
-    used_names=set(used_names or []); roles=MEAL_ROLE_RULES.get(meal_name,["main_protein","carb","vegetable"]); all_candidates=[]
+def build_meal(meal_name, target_kcal, target_p, target_c, target_f, food_mode, used_names=None, seed=0):
+    used_names=set(used_names or [])
+    roles=MEAL_ROLE_RULES.get(meal_name,["main_protein","carb","vegetable"])
+    all_candidates=[]
     for role in roles:
-        pool=_dedupe_pool(get_meal_pool(role,food_mode))
-        pool=sorted(pool,key=lambda f:(-meal_compatibility(meal_name,role,f),_food_key(f)))[:36]
+        pool=_dedupe_pool(get_meal_pool(role, food_mode))
+        # Rank contextually; do not hard-delete foods. Keep a broad candidate pool.
+        pool=sorted(pool, key=lambda f: (-_meal_fit(meal_name,role,f), _food_key(f) in used_names, _food_key(f)))[:36]
         for food in pool:
+            fit=_meal_fit(meal_name,role,food)
             for grams in _portion_candidates(food,role):
-                all_candidates.append({"food":food,"role":role,"grams":grams,"nut":_nutrition_for(food,grams)})
-    chosen=_solve_combo(meal_name,all_candidates,target_kcal,target_p,target_c,target_f,used_names)
-    if not chosen: chosen=_greedy_combo(meal_name,all_candidates,target_kcal,target_p,target_c,target_f,used_names)
+                nut=_nutrition_for(food,grams)
+                # Reject only physically nonsensical nutrition rows, never semantic foods.
+                if nut["kcal"] <= 0: continue
+                all_candidates.append({"food":food,"role":role,"grams":grams,"nut":nut,"fit":fit})
+    chosen=_solve_combo(all_candidates,target_kcal,target_p,target_c,target_f,used_names)
+    if not chosen: chosen=_greedy_combo(all_candidates,target_kcal,target_p,target_c,target_f,used_names)
     if not chosen: raise RuntimeError(f"Nuk u gjet kombinim ushqimesh për {meal_name}.")
-    totals={k:sum(x["nut"][k] for x in chosen) for k in ["kcal","protein","carbs","fat"]}
-    return {"name":meal_name,"target":target_kcal,
-      "items":[{"name":x["food"]["product_name"],"role":x["role"],"grams":round(x["grams"]),"kcal":round(x["nut"]["kcal"]),"protein":round(x["nut"]["protein"],1),"carbs":round(x["nut"]["carbs"],1),"fat":round(x["nut"]["fat"],1)} for x in chosen],
-      "totals":{"kcal":round(totals["kcal"]),"protein":round(totals["protein"],1),"carbs":round(totals["carbs"],1),"fat":round(totals["fat"],1)}}
 
-def make_plan(target_kcal,target_p,target_c,target_f,meal_count,food_mode,seed=0):
-    meal_names=["Mëngjes","Drekë","Snack","Darkë","Snack 2","Vakt 6"][:meal_count]
-    distributions={2:[.45,.55],3:[.25,.40,.35],4:[.22,.33,.18,.27],5:[.20,.30,.15,.20,.15],6:[.18,.25,.12,.18,.15,.12]}[meal_count]
-    used_names=set(); meals=[]
-    for name,share in zip(meal_names,distributions):
-        meal=build_meal(name,target_kcal*share,target_p*share,target_c*share,target_f*share,food_mode,used_names,seed)
-        meals.append(meal); used_names.update(i["name"].strip().lower() for i in meal["items"])
+    # AI-style reviewer/repair: if the mathematical solution is nutritionally close
+    # but semantically poor, replace the weakest item with the best compatible option.
+    current_q=_meal_quality(meal_name,chosen)
+    for _ in range(2):
+        weak=min(chosen,key=lambda x:x["fit"])
+        alternatives=[x for x in all_candidates if x["role"]==weak["role"] and _food_key(x["food"])!=_food_key(weak["food"])]
+        best=None; best_q=current_q
+        for alt in alternatives[:120]:
+            trial=[x for x in chosen if x is not weak]+[alt]
+            q=_meal_quality(meal_name,trial)
+            totals={k:sum(x["nut"][k] for x in trial) for k in ["kcal","protein","carbs","fat"]}
+            err=abs(totals["kcal"]-target_kcal)/max(target_kcal,1)
+            if q>best_q and err<0.22:
+                best,best_q=alt,q
+        if best is None: break
+        chosen=[best if x is weak else x for x in chosen]; current_q=best_q
+
+    totals={k:sum(x["nut"][k] for x in chosen) for k in ["kcal","protein","carbs","fat"]}
+    return {"name":meal_name,"target":target_kcal,"quality":round(current_q,1),
+            "items":[{"name":x["food"]["product_name"],"role":x["role"],"grams":round(x["grams"]),
+                      "kcal":round(x["nut"]["kcal"]),"protein":round(x["nut"]["protein"],1),
+                      "carbs":round(x["nut"]["carbs"],1),"fat":round(x["nut"]["fat"],1)} for x in chosen],
+            "totals":{"kcal":round(totals["kcal"]),"protein":round(totals["protein"],1),
+                       "carbs":round(totals["carbs"],1),"fat":round(totals["fat"],1)}}
+
+def make_plan(target_kcal, target_p, target_c, target_f, meal_count, food_mode, seed=0):
+    meal_names = ["Mëngjes", "Drekë", "Snack", "Darkë", "Snack 2", "Vakt 6"][:meal_count]
+    distributions = {2:[0.45,0.55],3:[0.25,0.40,0.35],4:[0.22,0.33,0.18,0.27],5:[0.20,0.30,0.15,0.20,0.15],6:[0.18,0.25,0.12,0.18,0.15,0.12]}[meal_count]
+    used_names = set()
+    meals = []
+    for name, share in zip(meal_names, distributions):
+        meal = build_meal(name, target_kcal*share, target_p*share, target_c*share, target_f*share, food_mode, used_names=used_names, seed=seed)
+        meals.append(meal)
+        used_names.update(item["name"].strip().lower() for item in meal["items"])
     return meals
 
 def plan_totals(plan):
